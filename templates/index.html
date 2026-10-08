@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Keero</title>
+
+<!-- SiriWave UMD -->
+<script src="https://unpkg.com/siriwave/dist/siriwave.umd.min.js"></script>
+
+<style>
+  :root{ --bg:#0b0f1a; --muted:#9aa7c7; }
+  html,body{ height:100%; }
+  body{ background:var(--bg); color:#fff; font-family:Segoe UI, Arial, sans-serif; margin:0; padding:0; display:flex; align-items:center; justify-content:center; }
+  .app-shell{ position:relative; width:100%; height:100vh; overflow:hidden; }
+
+  /* Messages area sits above the wave with 15px gap */
+  .messages{ position:fixed; left:0; right:0; bottom:175px; max-width:900px; margin:0 auto; padding:0 16px; box-sizing:border-box; text-align:center; pointer-events:none; }
+  .msg{ display:inline-block; pointer-events:auto; background:rgba(255,255,255,0.04); padding:8px 12px; border-radius:12px; margin:6px 6px; color:#d9ecff; max-width:85%; word-wrap:break-word; }
+
+  /* Mic centered */
+  .mic-btn{ width:84px; height:84px; border-radius:50%; background:linear-gradient(180deg,#ff6b6b,#ff3b3b); border:none; display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 10px 30px rgba(0,0,0,0.5); position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:20; }
+  .mic-btn.inactive{ background:linear-gradient(180deg,#2b2f3a,#1a1d24); }
+  .mic-icon{ width:36px; height:36px; fill:#fff; }
+
+  /* SiriWave container fixed to bottom and full width */
+  #siri-container{ position:fixed; left:0; right:0; bottom:0; height:160px; width:100%; z-index:10; }
+
+  /* Small helper for accessibility overlay removed */
+</style>
+</head>
+<body>
+  <div class="app-shell">
+    <div id="messages" class="messages"></div>
+
+    <button id="mic" class="mic-btn inactive" aria-pressed="false" title="Toggle listen">
+      <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 14 0h-2zM11 20h2v2h-2z"/>
+      </svg>
+    </button>
+
+    <div id="siri-container"></div>
+  </div>
+
+<script>
+// Create SiriWave instance
+const siriContainer = document.getElementById('siri-container');
+const siriWave = new SiriWave({
+  container: siriContainer,
+  width: siriContainer.clientWidth,
+  height: 160,
+  style: 'ios9',
+  speed: 0.2,
+  amplitude: 0.02,
+  autostart: true
+});
+
+let isListening = false;
+let currentState = 'idle';
+const micBtn = document.getElementById('mic');
+const messagesEl = document.getElementById('messages');
+
+let lastRecognized = '';
+let lastReply = '';
+let recClearTimer = null;
+let repClearTimer = null;
+let recentMessagesSet = new Set(); // small dedupe cache
+
+function appendMessage(text){
+  if(!text) return;
+  // basic dedupe to avoid immediate repeats
+  if(recentMessagesSet.has(text)) return;
+  recentMessagesSet.add(text);
+  // keep cache small
+  if(recentMessagesSet.size>50){
+    recentMessagesSet = new Set(Array.from(recentMessagesSet).slice(-40));
+  }
+
+  const div = document.createElement('div');
+  div.className = 'msg';
+  div.textContent = text;
+  messagesEl.insertBefore(div, messagesEl.firstChild);
+  // keep only recent 20
+  while(messagesEl.children.length>20) messagesEl.removeChild(messagesEl.lastChild);
+}
+
+function setWaveForState(state) {
+  currentState = state;
+  if (state === 'idle') {
+    siriWave.setAmplitude && siriWave.setAmplitude(0.02);
+    siriWave.start && siriWave.start();
+  } else if (state === 'listening') {
+    siriWave.setAmplitude && siriWave.setAmplitude(0.45);
+    siriWave.start && siriWave.start();
+  } else if (state === 'replying') {
+    siriWave.setAmplitude && siriWave.setAmplitude(1.2);
+    siriWave.start && siriWave.start();
+  } else {
+    siriWave.setAmplitude && siriWave.setAmplitude(0.02);
+    siriWave.start && siriWave.start();
+  }
+}
+
+async function toggleListen() {
+  try {
+    if (!isListening) {
+      isListening = true;
+      micBtn.classList.remove('inactive');
+      micBtn.setAttribute('aria-pressed','true');
+      setWaveForState('listening');
+      await fetch('/start_listening');
+    } else {
+      isListening = false;
+      micBtn.classList.add('inactive');
+      micBtn.setAttribute('aria-pressed','false');
+      setWaveForState('idle');
+      await fetch('/stop_listening');
+    }
+  } catch (e) {
+    console.error(e);
+    // revert UI on error
+    isListening = !isListening;
+    micBtn.classList.toggle('inactive');
+    micBtn.setAttribute('aria-pressed', isListening ? 'true' : 'false');
+    setWaveForState(isListening ? 'listening' : 'idle');
+  }
+}
+
+micBtn.addEventListener('click', toggleListen);
+
+// Poll status: faster polling and more aggressive capture so short-lived server values are not missed
+setInterval(async () => {
+  try {
+    const r = await fetch('/status');
+    const j = await r.json();
+    const rec = (j.recognized || '').trim();
+    const rep = (j.reply || '').trim();
+    const s = (j.state || 'idle');
+
+    // append recognized text when present (debounced)
+    if(rec){
+      if(rec !== lastRecognized){
+        appendMessage(rec);
+        lastRecognized = rec;
+      }
+      // keep marker for a few seconds so duplicates don't spam, then clear so a new same phrase can appear later
+      clearTimeout(recClearTimer);
+      recClearTimer = setTimeout(()=>{ lastRecognized = ''; }, 4000);
+    }
+
+    // append reply when present (debounced)
+    if(rep){
+      if(rep !== lastReply){
+        appendMessage(rep);
+        lastReply = rep;
+      }
+      clearTimeout(repClearTimer);
+      repClearTimer = setTimeout(()=>{ lastReply = ''; }, 4000);
+    }
+
+    // Only change wave when server is replying. Otherwise respect user's mic toggle.
+    if(s === 'replying'){
+      setWaveForState('replying');
+    } else {
+      setWaveForState(isListening ? 'listening' : 'idle');
+    }
+  } catch (e) {
+    // ignore
+  }
+}, 200);
+
+// ensure wave width is correct on load and when resized
+window.addEventListener('load', () => {
+  resizeWave();
+});
+
+// Resize handler keeps wave full-width
+function resizeWave(){
+  siriWave.params.width = siriContainer.clientWidth;
+  siriWave.setAmplitude && siriWave.setAmplitude(siriWave.params.amplitude || 0.02);
+}
+window.addEventListener('resize', resizeWave);
+
+// start idle
+setWaveForState('idle');
+</script>
+</body>
+</html>
